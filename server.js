@@ -54,28 +54,32 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
   const { title, story, tags } = req.body;
   if (!title) return res.status(400).json({ error: 'Title required for Mmagic Post' });
   try {
-    // 1. Create the WordPress Draft Post
-    const postData = {
-      title: title,
-      content: `<p>${story}</p>`,
-      excerpt: story.substring(0, 150) + '...',
-      status: 'draft',
-      tags: tags ? tags.split(',').map(t => t.trim()) : [],
-      meta: { _mm_magic_generated: true }
-    };
-
     // Authenticate with Application Password
     const auth = Buffer.from(
       process.env.WP_USERNAME + ':' + process.env.WP_APP_PASSWORD
     ).toString('base64');
 
-    // Create the Post
+    // 1. Build Post Data
+    const postData = {
+      title: title,
+      content: `<p>${story}</p>`,
+      excerpt: story.substring(0, 150) + '...',
+      status: 'draft',
+      meta: { _mm_magic_generated: true }
+    };
+
+    // Add tags as objects (WordPress will create them)
+    if (tags && tags.trim() !== '') {
+      postData.tags = tags.split(',').map(t => ({ name: t.trim() }));
+    }
+
+    // 2. Create the Post
     const postResponse = await fetch('https://mm.world/wp-json/wp/v2/posts', {
       method: 'POST',
       headers: {
         'Authorization': 'Basic ' + auth,
         'Content-Type': 'application/json',
-        'User-Agent': 'Mmagic-Engine/1.0' // <-- Added User Agent
+        'User-Agent': 'Mmagic-Engine/1.0'
       },
       body: JSON.stringify(postData)
     });
@@ -88,7 +92,8 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
     const postJson = await postResponse.json();
     const postId = postJson.id;
 
-    // 2. Upload Image to WordPress Media Library
+    // 3. Upload Image to WordPress Media Library (if available)
+    let mediaId = null;
     if (lastImagePath && fs.existsSync(lastImagePath)) {
       try {
         const fileBuffer = fs.readFileSync(lastImagePath);
@@ -98,42 +103,47 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
         const formData = new FormData();
         formData.append('file', fileBuffer, filename);
 
-        // Upload Media
         const mediaResponse = await fetch('https://mm.world/wp-json/wp/v2/media', {
           method: 'POST',
           headers: {
             'Authorization': 'Basic ' + auth,
-            'User-Agent': 'Mmagic-Engine/1.0' // <-- Added User Agent here too
+            'User-Agent': 'Mmagic-Engine/1.0'
           },
           body: formData
         });
 
         if (mediaResponse.ok) {
           const mediaJson = await mediaResponse.json();
-          const mediaId = mediaJson.id;
-
-          // 3. Attach image to the post as the Featured Image
-          await fetch(`https://mm.world/wp-json/wp/v2/posts/${postId}`, {
-            method: 'POST',
-            headers: {
-              'Authorization': 'Basic ' + auth,
-              'Content-Type': 'application/json',
-              'User-Agent': 'Mmagic-Engine/1.0' // <-- Added User Agent here too
-            },
-            body: JSON.stringify({ featured_media: mediaId })
-          });
-
-          console.log('✅ Mmagic Post Created & Image Attached. ID:', postId);
+          mediaId = mediaJson.id;
+          console.log('✅ Image uploaded, Media ID:', mediaId);
         } else {
-          console.log('❌ Media upload failed but post created');
+          console.warn('⚠️ Media upload failed (Post still created)');
         }
-
         fs.unlinkSync(lastImagePath);
       } catch (imgErr) {
-        console.log('⚠️ Mmagic Image link error:', imgErr.message);
+        console.warn('⚠️ Image processing error:', imgErr.message);
       }
     }
 
+    // 4. Attach image to post if media ID exists
+    if (mediaId) {
+      try {
+        await fetch(`https://mm.world/wp-json/wp/v2/posts/${postId}`, {
+          method: 'POST',
+          headers: {
+            'Authorization': 'Basic ' + auth,
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mmagic-Engine/1.0'
+          },
+          body: JSON.stringify({ featured_media: mediaId })
+        });
+        console.log('✅ Featured image attached to Post ID:', postId);
+      } catch (attachErr) {
+        console.warn('⚠️ Could not attach image to post');
+      }
+    }
+
+    // Reset temp variables
     lastImagePath = null;
     lastImageMime = null;
 
