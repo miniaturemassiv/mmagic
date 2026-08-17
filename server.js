@@ -54,16 +54,14 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
   const { title, story, tags } = req.body;
   if (!title) return res.status(400).json({ error: 'Title required for Mmagic Post' });
   try {
-    // 1. Create the WordPress Draft Post (Not a Product)
+    // 1. Create the WordPress Draft Post
     const postData = {
       title: title,
       content: `<p>${story}</p>`,
       excerpt: story.substring(0, 150) + '...',
-      status: 'draft', // Always saves as a draft so you can review
+      status: 'draft',
       tags: tags ? tags.split(',').map(t => t.trim()) : [],
-      meta: {
-        _mm_magic_generated: true
-      }
+      meta: { _mm_magic_generated: true }
     };
 
     // Authenticate with Application Password
@@ -71,12 +69,13 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
       process.env.WP_USERNAME + ':' + process.env.WP_APP_PASSWORD
     ).toString('base64');
 
-    // Create the Post in WordPress REST API
+    // Create the Post
     const postResponse = await fetch('https://mm.world/wp-json/wp/v2/posts', {
       method: 'POST',
       headers: {
         'Authorization': 'Basic ' + auth,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mmagic-Engine/1.0' // <-- Added User Agent
       },
       body: JSON.stringify(postData)
     });
@@ -89,7 +88,7 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
     const postJson = await postResponse.json();
     const postId = postJson.id;
 
-    // 2. Upload Image to WordPress Media Library (The same trick that worked on vvbenz!)
+    // 2. Upload Image to WordPress Media Library
     if (lastImagePath && fs.existsSync(lastImagePath)) {
       try {
         const fileBuffer = fs.readFileSync(lastImagePath);
@@ -99,11 +98,12 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
         const formData = new FormData();
         formData.append('file', fileBuffer, filename);
 
-        // We fetch using the exact same header pattern that worked on vvbenz
+        // Upload Media
         const mediaResponse = await fetch('https://mm.world/wp-json/wp/v2/media', {
           method: 'POST',
           headers: {
-            'Authorization': 'Basic ' + auth
+            'Authorization': 'Basic ' + auth,
+            'User-Agent': 'Mmagic-Engine/1.0' // <-- Added User Agent here too
           },
           body: formData
         });
@@ -117,11 +117,10 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
             method: 'POST',
             headers: {
               'Authorization': 'Basic ' + auth,
-              'Content-Type': 'application/json'
+              'Content-Type': 'application/json',
+              'User-Agent': 'Mmagic-Engine/1.0' // <-- Added User Agent here too
             },
-            body: JSON.stringify({
-              featured_media: mediaId
-            })
+            body: JSON.stringify({ featured_media: mediaId })
           });
 
           console.log('✅ Mmagic Post Created & Image Attached. ID:', postId);
@@ -145,6 +144,7 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
     });
     
   } catch (e) {
+    console.error('Publish Error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
