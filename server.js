@@ -28,6 +28,48 @@ Create an engaging human-interest story based on the image. Return this JSON str
   "tags": "comma, separated, relevant, keywords, for, searching"
 }`;
 
+// ------------------------------------------------------------------
+// HELPER: Convert Tag Strings into WordPress Tag IDs
+// (Updated with Defensive Array Check)
+// ------------------------------------------------------------------
+async function getOrCreateTagIds(tagNamesArray, wpUrl, authHeader) {
+  const tagIds = [];
+  for (const name of tagNamesArray) {
+    const cleanName = name.trim();
+    if (!cleanName) continue;
+
+    // 1. Search if the tag already exists
+    const searchRes = await fetch(
+      `${wpUrl}/wp-json/wp/v2/tags?search=${encodeURIComponent(cleanName)}`,
+      { headers: { Authorization: authHeader } }
+    );
+    const existingTags = await searchRes.json();
+    
+    // 2. SAFETY CHECK: Ensure it's an array before using .find()
+    const match = Array.isArray(existingTags) 
+      ? existingTags.find(t => t.name.toLowerCase() === cleanName.toLowerCase())
+      : null;
+
+    if (match) {
+      tagIds.push(match.id); // Use existing ID
+    } else {
+      // 3. Create new tag if it doesn't exist
+      const createRes = await fetch(`${wpUrl}/wp-json/wp/v2/tags`, {
+        method: "POST",
+        headers: {
+          Authorization: authHeader,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ name: cleanName }),
+      });
+      const newTag = await createRes.json();
+      if (newTag.id) tagIds.push(newTag.id);
+    }
+  }
+  return tagIds;
+}
+// ------------------------------------------------------------------
+
 app.post('/mmagic/analyze', upload.single('mm_media'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No media dropped' });
   try {
@@ -53,13 +95,16 @@ app.post('/mmagic/analyze', upload.single('mm_media'), async (req, res) => {
 app.post('/mmagic/publish', express.json(), async (req, res) => {
   const { title, story, tags } = req.body;
   if (!title) return res.status(400).json({ error: 'Title required for Mmagic Post' });
+  
   try {
-    // Authenticate using Application Password
+    // Authenticate with WordPress
     const auth = Buffer.from(
       process.env.WP_USERNAME + ':' + process.env.WP_APP_PASSWORD
     ).toString('base64');
+    const authHeader = 'Basic ' + auth;
+    const wpUrl = 'https://mm.world';
 
-    // 1. Build the Post Data Object
+    // Build the content
     const postData = {
       title: title,
       content: `<p>${story}</p>`,
@@ -68,17 +113,18 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
       meta: { _mm_magic_generated: true }
     };
 
-    // 2. Handle Tags Correctly (Array of Objects)
+    // Convert strings to tag IDs
     if (tags && tags.trim() !== '') {
-      const tagArray = tags.split(',').map(t => t.trim()).filter(t => t.length > 0);
-      postData.tags = tagArray.map(name => ({ name: name }));
+      const tagNameArray = tags.split(',').map(t => t.trim()).filter(t => t.length > 0);
+      const tagIds = await getOrCreateTagIds(tagNameArray, wpUrl, authHeader);
+      postData.tags = tagIds; // Passing Array of Integers
     }
 
-    // 3. Send to WordPress API to create the Draft Post
-    const postResponse = await fetch('https://mm.world/wp-json/wp/v2/posts', {
+    // Create the Post
+    const postResponse = await fetch(`${wpUrl}/wp-json/wp/v2/posts`, {
       method: 'POST',
       headers: {
-        'Authorization': 'Basic ' + auth,
+        'Authorization': authHeader,
         'Content-Type': 'application/json',
         'User-Agent': 'Mmagic-Engine/1.0'
       },
@@ -93,7 +139,10 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
     const postJson = await postResponse.json();
     const postId = postJson.id;
 
-    // 4. Upload Image to WordPress Media Library
+    // ------------------------------------------------------------------
+    // UPLOAD IMAGE TO WORDPRESS MEDIA LIBRARY
+    // FIX: Added ...formData.getHeaders() to let WordPress read the file
+    // ------------------------------------------------------------------
     let mediaId = null;
     if (lastImagePath && fs.existsSync(lastImagePath)) {
       try {
@@ -104,10 +153,11 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
         const formData = new FormData();
         formData.append('file', fileBuffer, filename);
 
-        const mediaResponse = await fetch('https://mm.world/wp-json/wp/v2/media', {
+        const mediaResponse = await fetch(`${wpUrl}/wp-json/wp/v2/media`, {
           method: 'POST',
           headers: {
-            'Authorization': 'Basic ' + auth,
+            ...formData.getHeaders(), // <--- CRITICAL FIX FOR IMAGE UPLOAD
+            'Authorization': authHeader,
             'User-Agent': 'Mmagic-Engine/1.0'
           },
           body: formData
@@ -118,23 +168,23 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
           mediaId = mediaJson.id;
           console.log('✅ Image uploaded, Media ID:', mediaId);
         } else {
-          console.warn('⚠️ Media upload failed (Post still created)');
+          const errText = await mediaResponse.text();
+          console.warn('⚠️ Media upload failed:', errText);
         }
 
-        // Clean up temp file
         fs.unlinkSync(lastImagePath);
       } catch (imgErr) {
         console.warn('⚠️ Image processing error:', imgErr.message);
       }
     }
 
-    // 5. Attach Image as Featured Media (if upload succeeded)
+    // Attach Image as Featured Media
     if (mediaId) {
       try {
-        await fetch(`https://mm.world/wp-json/wp/v2/posts/${postId}`, {
+        await fetch(`${wpUrl}/wp-json/wp/v2/posts/${postId}`, {
           method: 'POST',
           headers: {
-            'Authorization': 'Basic ' + auth,
+            'Authorization': authHeader,
             'Content-Type': 'application/json',
             'User-Agent': 'Mmagic-Engine/1.0'
           },
@@ -146,7 +196,7 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
       }
     }
 
-    // Clean up global variables
+    // Cleanup
     lastImagePath = null;
     lastImageMime = null;
 
