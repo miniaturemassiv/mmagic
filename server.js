@@ -54,12 +54,12 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
   const { title, story, tags } = req.body;
   if (!title) return res.status(400).json({ error: 'Title required for Mmagic Post' });
   try {
-    // Authenticate with Application Password
+    // Authenticate using Application Password
     const auth = Buffer.from(
       process.env.WP_USERNAME + ':' + process.env.WP_APP_PASSWORD
     ).toString('base64');
 
-    // 1. Build Post Data
+    // 1. Build the Post Data Object
     const postData = {
       title: title,
       content: `<p>${story}</p>`,
@@ -68,12 +68,13 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
       meta: { _mm_magic_generated: true }
     };
 
-    // Add tags as objects (WordPress will create them)
+    // 2. Handle Tags Correctly (Array of Objects)
     if (tags && tags.trim() !== '') {
-      postData.tags = tags.split(',').map(t => ({ name: t.trim() }));
+      const tagArray = tags.split(',').map(t => t.trim()).filter(t => t.length > 0);
+      postData.tags = tagArray.map(name => ({ name: name }));
     }
 
-    // 2. Create the Post
+    // 3. Send to WordPress API to create the Draft Post
     const postResponse = await fetch('https://mm.world/wp-json/wp/v2/posts', {
       method: 'POST',
       headers: {
@@ -88,11 +89,11 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
       const errText = await postResponse.text();
       throw new Error(`WordPress Post Creation failed: ${errText}`);
     }
-    
+
     const postJson = await postResponse.json();
     const postId = postJson.id;
 
-    // 3. Upload Image to WordPress Media Library (if available)
+    // 4. Upload Image to WordPress Media Library
     let mediaId = null;
     if (lastImagePath && fs.existsSync(lastImagePath)) {
       try {
@@ -119,13 +120,15 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
         } else {
           console.warn('⚠️ Media upload failed (Post still created)');
         }
+
+        // Clean up temp file
         fs.unlinkSync(lastImagePath);
       } catch (imgErr) {
         console.warn('⚠️ Image processing error:', imgErr.message);
       }
     }
 
-    // 4. Attach image to post if media ID exists
+    // 5. Attach Image as Featured Media (if upload succeeded)
     if (mediaId) {
       try {
         await fetch(`https://mm.world/wp-json/wp/v2/posts/${postId}`, {
@@ -143,7 +146,7 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
       }
     }
 
-    // Reset temp variables
+    // Clean up global variables
     lastImagePath = null;
     lastImageMime = null;
 
@@ -152,7 +155,7 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
       post_id: postId, 
       edit_link: `https://mm.world/wp-admin/post.php?post=${postId}&action=edit` 
     });
-    
+
   } catch (e) {
     console.error('Publish Error:', e.message);
     res.status(500).json({ error: e.message });
