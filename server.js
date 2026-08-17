@@ -30,7 +30,6 @@ Create an engaging human-interest story based on the image. Return this JSON str
 
 // ------------------------------------------------------------------
 // HELPER: Convert Tag Strings into WordPress Tag IDs
-// (Updated with Defensive Array Check)
 // ------------------------------------------------------------------
 async function getOrCreateTagIds(tagNamesArray, wpUrl, authHeader) {
   const tagIds = [];
@@ -38,14 +37,14 @@ async function getOrCreateTagIds(tagNamesArray, wpUrl, authHeader) {
     const cleanName = name.trim();
     if (!cleanName) continue;
 
-    // 1. Search if the tag already exists
+    // Search if the tag already exists
     const searchRes = await fetch(
       `${wpUrl}/wp-json/wp/v2/tags?search=${encodeURIComponent(cleanName)}`,
       { headers: { Authorization: authHeader } }
     );
     const existingTags = await searchRes.json();
     
-    // 2. SAFETY CHECK: Ensure it's an array before using .find()
+    // Defensive check: ensure it's an array before finding
     const match = Array.isArray(existingTags) 
       ? existingTags.find(t => t.name.toLowerCase() === cleanName.toLowerCase())
       : null;
@@ -53,7 +52,7 @@ async function getOrCreateTagIds(tagNamesArray, wpUrl, authHeader) {
     if (match) {
       tagIds.push(match.id); // Use existing ID
     } else {
-      // 3. Create new tag if it doesn't exist
+      // Create new tag if it doesn't exist
       const createRes = await fetch(`${wpUrl}/wp-json/wp/v2/tags`, {
         method: "POST",
         headers: {
@@ -113,7 +112,7 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
       meta: { _mm_magic_generated: true }
     };
 
-    // Convert strings to tag IDs
+    // Convert strings to Tag IDs
     if (tags && tags.trim() !== '') {
       const tagNameArray = tags.split(',').map(t => t.trim()).filter(t => t.length > 0);
       const tagIds = await getOrCreateTagIds(tagNameArray, wpUrl, authHeader);
@@ -133,7 +132,11 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
 
     if (!postResponse.ok) {
       const errText = await postResponse.text();
-      throw new Error(`WordPress Post Creation failed: ${errText}`);
+      // LOG THE RAW HTML TO RENDER LOGS
+      console.error(`❌ WordPress Error Status: ${postResponse.status}`);
+      console.error(`❌ WordPress Raw Response: ${errText}`);
+      // Send a clean error to the frontend
+      throw new Error(`WordPress returned a ${postResponse.status} error. Check Render Logs for details.`);
     }
 
     const postJson = await postResponse.json();
@@ -141,7 +144,6 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
 
     // ------------------------------------------------------------------
     // UPLOAD IMAGE TO WORDPRESS MEDIA LIBRARY
-    // FIX: Added ...formData.getHeaders() to let WordPress read the file
     // ------------------------------------------------------------------
     let mediaId = null;
     if (lastImagePath && fs.existsSync(lastImagePath)) {
@@ -156,7 +158,7 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
         const mediaResponse = await fetch(`${wpUrl}/wp-json/wp/v2/media`, {
           method: 'POST',
           headers: {
-            ...formData.getHeaders(), // <--- CRITICAL FIX FOR IMAGE UPLOAD
+            ...formData.getHeaders(), // CRITICAL FOR IMAGE UPLOAD
             'Authorization': authHeader,
             'User-Agent': 'Mmagic-Engine/1.0'
           },
