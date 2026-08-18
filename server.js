@@ -56,7 +56,7 @@ async function getOrCreateCategoryId(categoryName, wpUrl, authHeader) {
   } catch (err) { console.warn(`Category error:`, err.message); return null; }
 }
 
-// --- The proven binary upload function ---
+// --- FIXED: The proven binary upload logic is now fully included ---
 async function uploadMediaToWordPress(file, filename, mimeType, wpUrl, authHeader) {
   const mediaRes = await fetch(`${wpUrl}/wp-json/wp/v2/media`, {
     method: 'POST',
@@ -68,12 +68,15 @@ async function uploadMediaToWordPress(file, filename, mimeType, wpUrl, authHeade
     },
     body: file.buffer,
   });
+
   if (!mediaRes.ok) {
     const errText = await mediaRes.text();
     console.error(`❌ Media Upload Failed for ${filename}:`, errText);
     return null;
   }
-  return await mediaRes.json();
+  const json = await mediaRes.json();
+  // CRITICAL FIX: Return the full object so we have access to both 'id' and 'source_url'
+  return { id: json.id, source_url: json.source_url }; 
 }
 
 // --- CHANGE 2: Route accepts multiple files ---
@@ -98,24 +101,25 @@ app.post('/mmagic/analyze', upload.array('mm_media', 10), async (req, res) => {
     const cleanJson = JSON.parse(raw.replace(/```json|```/g, '').trim());
 
     // 2. Upload ALL files to WordPress Media Library
-    const uploadedIds = [];
+    // FIXED: Storing the entire object, not just the ID
+    const uploadedMediaObjects = []; 
     for (const file of req.files) {
       const ext = file.mimetype.split('/')[1] || 'bin';
       const filename = `mmagic-${Date.now()}-${Math.random().toString(36).substring(7)}.${ext}`;
       const mediaJson = await uploadMediaToWordPress(file, filename, file.mimetype, wpUrl, authHeader);
-      if (mediaJson && mediaJson.id) uploadedIds.push(mediaJson.id);
+      if (mediaJson && mediaJson.id) uploadedMediaObjects.push(mediaJson);
     }
 
-    if (uploadedIds.length === 0) {
+    if (uploadedMediaObjects.length === 0) {
       return res.status(500).json({ error: 'No media could be uploaded to WordPress.' });
     }
 
-       // 3. Build a gallery HTML for the post body (if multiple images)
+    // 3. Build a gallery HTML for the post body (if multiple images)
     let galleryHtml = '';
-    if (uploadedIds.length > 1) {
+    if (uploadedMediaObjects.length > 1) {
       galleryHtml = `<div class="mm-gallery" style="display:flex; flex-wrap:wrap; gap:16px; margin-top:24px;">`;
-      for (let i = 1; i < uploadedIds.length; i++) {
-        const mediaObj = uploadedIds[i]; // <--- This is now an object, not just an integer
+      for (let i = 1; i < uploadedMediaObjects.length; i++) {
+        const mediaObj = uploadedMediaObjects[i]; // <--- This is now a proper object!
         // Use mediaObj.source_url for the HTML img src!
         const url = mediaObj.source_url; 
         const id = mediaObj.id;
@@ -131,8 +135,8 @@ app.post('/mmagic/analyze', upload.array('mm_media', 10), async (req, res) => {
     // 4. Return everything to the frontend (including media IDs and gallery HTML)
     res.json({
       ...cleanJson,
-      media_ids: uploadedIds,      // Array of all WP media IDs
-      featured_media: uploadedIds[0],
+      media_ids: uploadedMediaObjects,      // Array of all WP media objects
+      featured_media: uploadedMediaObjects[0].id,
       gallery_html: galleryHtml,   // Pre-built HTML for the post body
     });
   } catch (e) {
@@ -141,7 +145,7 @@ app.post('/mmagic/analyze', upload.array('mm_media', 10), async (req, res) => {
   }
 });
 
-// --- Publishing Endpoint (unchanged logic, but now accepts media_ids and gallery_html) ---
+// --- Publishing Endpoint ---
 app.post('/mmagic/publish', express.json(), async (req, res) => {
   const { title, story, tags, category, media_ids, featured_media, gallery_html, publishNow } = req.body;
   if (!title) return res.status(400).json({ error: 'Title is required' });
@@ -157,7 +161,7 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
       excerpt: `${story.substring(0, 150)}...`,
       status: publishNow === true ? 'publish' : 'draft',
       featured_media: parseInt(featured_media, 10),
-      meta: { _mm_magic_generated: true, _mm_media_ids: media_ids ? media_ids.join(',') : '' },
+      meta: { _mm_magic_generated: true, _mm_media_ids: Array.isArray(media_ids) ? media_ids.map(m => m.id).join(',') : '' },
     };
 
     if (tags && tags.trim() !== '') {
