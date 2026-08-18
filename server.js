@@ -25,7 +25,8 @@ Create an engaging human-interest story based on the image. Return this JSON str
 {
   "title": "A compelling headline (5-10 words)",
   "story": "A beautiful, engaging 3-4 sentence paragraph describing the subject and its significance.",
-  "tags": "comma, separated, relevant, keywords, for, searching"
+  "tags": "comma, separated, relevant, keywords, for, searching",
+  "category": "A suggested main category for this post"
 }`;
 
 // ------------------------------------------------------------------
@@ -36,30 +37,16 @@ async function getOrCreateTagIds(tagNamesArray, wpUrl, authHeader) {
   for (const name of tagNamesArray) {
     const cleanName = name.trim();
     if (!cleanName) continue;
-
-    // Search if the tag already exists
-    const searchRes = await fetch(
-      `${wpUrl}/wp-json/wp/v2/tags?search=${encodeURIComponent(cleanName)}`,
-      { headers: { Authorization: authHeader } }
-    );
+    const searchRes = await fetch(`${wpUrl}/wp-json/wp/v2/tags?search=${encodeURIComponent(cleanName)}`, { headers: { Authorization: authHeader } });
     const existingTags = await searchRes.json();
-    
-    // Defensive check: ensure it's an array before finding
-    const match = Array.isArray(existingTags) 
-      ? existingTags.find(t => t.name.toLowerCase() === cleanName.toLowerCase())
-      : null;
-
+    const match = Array.isArray(existingTags) ? existingTags.find(t => t.name.toLowerCase() === cleanName.toLowerCase()) : null;
     if (match) {
-      tagIds.push(match.id); // Use existing ID
+      tagIds.push(match.id);
     } else {
-      // Create new tag if it doesn't exist
       const createRes = await fetch(`${wpUrl}/wp-json/wp/v2/tags`, {
         method: "POST",
-        headers: {
-          Authorization: authHeader,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ name: cleanName }),
+        headers: { Authorization: authHeader, "Content-Type": "application/json" },
+        body: JSON.stringify({ name: cleanName })
       });
       const newTag = await createRes.json();
       if (newTag.id) tagIds.push(newTag.id);
@@ -67,7 +54,29 @@ async function getOrCreateTagIds(tagNamesArray, wpUrl, authHeader) {
   }
   return tagIds;
 }
+
 // ------------------------------------------------------------------
+// HELPER: Convert Category Strings into WordPress Category ID
+// ------------------------------------------------------------------
+async function getOrCreateCategoryId(categoryName, wpUrl, authHeader) {
+  const cleanName = categoryName.trim();
+  if (!cleanName) return null;
+
+  // Search for existing category
+  const searchRes = await fetch(`${wpUrl}/wp-json/wp/v2/categories?search=${encodeURIComponent(cleanName)}`, { headers: { Authorization: authHeader } });
+  const existingCategories = await searchRes.json();
+  const match = Array.isArray(existingCategories) ? existingCategories.find(c => c.name.toLowerCase() === cleanName.toLowerCase()) : null;
+  if (match) return match.id;
+
+  // Create new category
+  const createRes = await fetch(`${wpUrl}/wp-json/wp/v2/categories`, {
+    method: "POST",
+    headers: { Authorization: authHeader, "Content-Type": "application/json" },
+    body: JSON.stringify({ name: cleanName })
+  });
+  const newCategory = await createRes.json();
+  return newCategory.id || null;
+}
 
 app.post('/mmagic/analyze', upload.single('mm_media'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No media dropped' });
@@ -92,58 +101,53 @@ app.post('/mmagic/analyze', upload.single('mm_media'), async (req, res) => {
 });
 
 app.post('/mmagic/publish', express.json(), async (req, res) => {
-  const { title, story, tags } = req.body;
+  const { title, story, tags, category, publishNow } = req.body;
   if (!title) return res.status(400).json({ error: 'Title required for Mmagic Post' });
   
   try {
-    // Authenticate with WordPress
-    const auth = Buffer.from(
-      process.env.WP_USERNAME + ':' + process.env.WP_APP_PASSWORD
-    ).toString('base64');
+    const auth = Buffer.from(process.env.WP_USERNAME + ':' + process.env.WP_APP_PASSWORD).toString('base64');
     const authHeader = 'Basic ' + auth;
     const wpUrl = 'https://mm.world';
 
-    // Build the content
     const postData = {
       title: title,
       content: `<p>${story}</p>`,
       excerpt: story.substring(0, 150) + '...',
-      status: 'draft',
+      status: publishNow === true ? 'publish' : 'draft',
       meta: { _mm_magic_generated: true }
     };
 
-    // Convert strings to Tag IDs
+    // Handle Tags (Integers)
     if (tags && tags.trim() !== '') {
       const tagNameArray = tags.split(',').map(t => t.trim()).filter(t => t.length > 0);
       const tagIds = await getOrCreateTagIds(tagNameArray, wpUrl, authHeader);
-      postData.tags = tagIds; // Passing Array of Integers
+      postData.tags = tagIds;
+    }
+
+    // Handle Categories (Integer)
+    if (category && category.trim() !== '') {
+      const catId = await getOrCreateCategoryId(category, wpUrl, authHeader);
+      if (catId) postData.categories = [catId];
     }
 
     // Create the Post
     const postResponse = await fetch(`${wpUrl}/wp-json/wp/v2/posts`, {
       method: 'POST',
-      headers: {
-        'Authorization': authHeader,
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mmagic-Engine/1.0'
-      },
+      headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'User-Agent': 'Mmagic-Engine/1.0' },
       body: JSON.stringify(postData)
     });
 
     if (!postResponse.ok) {
       const errText = await postResponse.text();
-      // LOG THE RAW HTML TO RENDER LOGS
-      console.error(`❌ WordPress Error Status: ${postResponse.status}`);
-      console.error(`❌ WordPress Raw Response: ${errText}`);
-      // Send a clean error to the frontend
-      throw new Error(`WordPress returned a ${postResponse.status} error. Check Render Logs for details.`);
+      console.error(`❌ Post Error: ${errText}`);
+      throw new Error(`WordPress returned a ${postResponse.status} error. Check logs.`);
     }
 
     const postJson = await postResponse.json();
     const postId = postJson.id;
 
     // ------------------------------------------------------------------
-    // UPLOAD IMAGE TO WORDPRESS MEDIA LIBRARY
+    // UPLOAD IMAGE & TIGHTLY ATTACH FEATURED MEDIA
     // ------------------------------------------------------------------
     let mediaId = null;
     if (lastImagePath && fs.existsSync(lastImagePath)) {
@@ -157,11 +161,7 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
 
         const mediaResponse = await fetch(`${wpUrl}/wp-json/wp/v2/media`, {
           method: 'POST',
-          headers: {
-            ...formData.getHeaders(), // CRITICAL FOR IMAGE UPLOAD
-            'Authorization': authHeader,
-            'User-Agent': 'Mmagic-Engine/1.0'
-          },
+          headers: { ...formData.getHeaders(), 'Authorization': authHeader, 'User-Agent': 'Mmagic-Engine/1.0' },
           body: formData
         });
 
@@ -169,32 +169,31 @@ app.post('/mmagic/publish', express.json(), async (req, res) => {
           const mediaJson = await mediaResponse.json();
           mediaId = mediaJson.id;
           console.log('✅ Image uploaded, Media ID:', mediaId);
+
+          // CRITICAL: Attach image as Featured Image
+          const attachRes = await fetch(`${wpUrl}/wp-json/wp/v2/posts/${postId}`, {
+            method: 'POST',
+            headers: { 'Authorization': authHeader, 'Content-Type': 'application/json', 'User-Agent': 'Mmagic-Engine/1.0' },
+            body: JSON.stringify({ featured_media: mediaId })
+          });
+
+          if (attachRes.ok) {
+            console.log('✅ Featured image attached to Post ID:', postId);
+          } else {
+            const attachErr = await attachRes.text();
+            console.error('❌ Failed to attach featured image:', attachErr);
+            throw new Error('Failed to attach featured image to the post.');
+          }
         } else {
           const errText = await mediaResponse.text();
-          console.warn('⚠️ Media upload failed:', errText);
+          console.error('❌ Media upload failed:', errText);
+          throw new Error('Image upload failed. Check file size/format.');
         }
 
         fs.unlinkSync(lastImagePath);
       } catch (imgErr) {
-        console.warn('⚠️ Image processing error:', imgErr.message);
-      }
-    }
-
-    // Attach Image as Featured Media
-    if (mediaId) {
-      try {
-        await fetch(`${wpUrl}/wp-json/wp/v2/posts/${postId}`, {
-          method: 'POST',
-          headers: {
-            'Authorization': authHeader,
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mmagic-Engine/1.0'
-          },
-          body: JSON.stringify({ featured_media: mediaId })
-        });
-        console.log('✅ Featured image attached to Post ID:', postId);
-      } catch (attachErr) {
-        console.warn('⚠️ Could not attach image to post');
+        console.error('❌ Image processing error:', imgErr.message);
+        throw new Error(`Image processing error: ${imgErr.message}`);
       }
     }
 
