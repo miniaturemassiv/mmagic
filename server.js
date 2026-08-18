@@ -110,17 +110,24 @@ app.post('/mmagic/analyze', upload.array('mm_media', 10), async (req, res) => {
       return res.status(500).json({ error: 'No media could be uploaded to WordPress.' });
     }
 
-    // 3. Build a gallery HTML for the post body (if multiple images)
+       // 3. Build a gallery HTML for the post body (if multiple images)
     let galleryHtml = '';
     if (uploadedIds.length > 1) {
       galleryHtml = `<div class="mm-gallery" style="display:flex; flex-wrap:wrap; gap:16px; margin-top:24px;">`;
       for (let i = 1; i < uploadedIds.length; i++) {
-        const id = uploadedIds[i];
-        galleryHtml += `<div style="flex:1 1 250px;"><img src="${wpUrl}/wp-content/uploads/${id}" alt="${cleanJson.title}" style="width:100%; height:auto; border-radius:8px;" /></div>`;
+        const mediaObj = uploadedIds[i]; // <--- This is now an object, not just an integer
+        // Use mediaObj.source_url for the HTML img src!
+        const url = mediaObj.source_url; 
+        const id = mediaObj.id;
+        
+        galleryHtml += `
+        <div style="flex:1 1 250px;">
+          <img src="${url}" alt="${cleanJson.title}" style="width:100%; height:auto; border-radius:8px;" />
+        </div>`;
       }
       galleryHtml += `</div>`;
     }
-
+    
     // 4. Return everything to the frontend (including media IDs and gallery HTML)
     res.json({
       ...cleanJson,
