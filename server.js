@@ -7,6 +7,8 @@ const path = require('path');
 
 const app = express();
 app.use(cors());
+
+// CHANGE 1: Allow multiple files
 const upload = multer({ storage: multer.memoryStorage() });
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -20,119 +22,111 @@ const MMAGIC_PROMPT = `You are the Mmagic engine, a proprietary storytelling too
   "category": "A single relevant category name (e.g. Music & Culture, Design, Architecture)"
 }`;
 
-// --- Helper: Tag IDs ---
+// --- Helpers ---
 async function getOrCreateTagIds(tagNamesArray, wpUrl, authHeader) {
   const tagIds = [];
   for (const name of tagNamesArray) {
     const cleanName = name.trim();
     if (!cleanName) continue;
     try {
-      const searchRes = await fetch(
-        `${wpUrl}/wp-json/wp/v2/tags?search=${encodeURIComponent(cleanName)}`,
-        { headers: { Authorization: authHeader } }
-      );
+      const searchRes = await fetch(`${wpUrl}/wp-json/wp/v2/tags?search=${encodeURIComponent(cleanName)}`, { headers: { Authorization: authHeader } });
       const existing = await searchRes.json();
-      const match = Array.isArray(existing)
-        ? existing.find(t => t.name.toLowerCase() === cleanName.toLowerCase())
-        : null;
-
-      if (match) {
-        tagIds.push(match.id);
-      } else {
-        const createRes = await fetch(`${wpUrl}/wp-json/wp/v2/tags`, {
-          method: 'POST',
-          headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: cleanName }),
-        });
+      const match = Array.isArray(existing) ? existing.find(t => t.name.toLowerCase() === cleanName.toLowerCase()) : null;
+      if (match) { tagIds.push(match.id); } else {
+        const createRes = await fetch(`${wpUrl}/wp-json/wp/v2/tags`, { method: 'POST', headers: { Authorization: authHeader, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: cleanName }) });
         const newTag = await createRes.json();
         if (newTag && newTag.id) tagIds.push(newTag.id);
       }
-    } catch (err) {
-      console.warn(`Tag error (${cleanName}):`, err.message);
-    }
+    } catch (err) { console.warn(`Tag error:`, err.message); }
   }
   return tagIds;
 }
 
-// --- Helper: Category ID ---
 async function getOrCreateCategoryId(categoryName, wpUrl, authHeader) {
   const cleanName = categoryName.trim();
   if (!cleanName) return null;
   try {
-    const searchRes = await fetch(
-      `${wpUrl}/wp-json/wp/v2/categories?search=${encodeURIComponent(cleanName)}`,
-      { headers: { Authorization: authHeader } }
-    );
+    const searchRes = await fetch(`${wpUrl}/wp-json/wp/v2/categories?search=${encodeURIComponent(cleanName)}`, { headers: { Authorization: authHeader } });
     const existing = await searchRes.json();
-    const match = Array.isArray(existing)
-      ? existing.find(c => c.name.toLowerCase() === cleanName.toLowerCase())
-      : null;
-
+    const match = Array.isArray(existing) ? existing.find(c => c.name.toLowerCase() === cleanName.toLowerCase()) : null;
     if (match) return match.id;
-
-    const createRes = await fetch(`${wpUrl}/wp-json/wp/v2/categories`, {
-      method: 'POST',
-      headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: cleanName }),
-    });
+    const createRes = await fetch(`${wpUrl}/wp-json/wp/v2/categories`, { method: 'POST', headers: { Authorization: authHeader, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: cleanName }) });
     const newCat = await createRes.json();
     return newCat && newCat.id ? newCat.id : null;
-  } catch (err) {
-    console.warn(`Category error (${cleanName}):`, err.message);
-    return null;
-  }
+  } catch (err) { console.warn(`Category error:`, err.message); return null; }
 }
 
-// --- 1. ANALYZE & UPLOAD MEDIA SIMULTANEOUSLY ---
-app.post('/mmagic/analyze', upload.single('mm_media'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No media uploaded' });
+// --- The proven binary upload function ---
+async function uploadMediaToWordPress(file, filename, mimeType, wpUrl, authHeader) {
+  const mediaRes = await fetch(`${wpUrl}/wp-json/wp/v2/media`, {
+    method: 'POST',
+    headers: {
+      Authorization: authHeader,
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Type': mimeType,
+      'User-Agent': 'Mmagic-Engine/1.0',
+    },
+    body: file.buffer,
+  });
+  if (!mediaRes.ok) {
+    const errText = await mediaRes.text();
+    console.error(`❌ Media Upload Failed for ${filename}:`, errText);
+    return null;
+  }
+  return await mediaRes.json();
+}
+
+// --- CHANGE 2: Route accepts multiple files ---
+app.post('/mmagic/analyze', upload.array('mm_media', 10), async (req, res) => {
+  if (!req.files || req.files.length === 0) {
+    return res.status(400).json({ error: 'No media dropped' });
+  }
 
   try {
-    const auth = Buffer.from(
-      `${process.env.WP_USERNAME}:${process.env.WP_APP_PASSWORD}`
-    ).toString('base64');
+    const auth = Buffer.from(`${process.env.WP_USERNAME}:${process.env.WP_APP_PASSWORD}`).toString('base64');
     const authHeader = `Basic ${auth}`;
     const wpUrl = 'https://mm.world';
 
-    // A. Generate AI story
-    const imageBase64 = req.file.buffer.toString('base64');
+    // 1. Analyze the FIRST image for title/story/tags
+    const firstFile = req.files[0];
+    const imageBase64 = firstFile.buffer.toString('base64');
     const result = await model.generateContent([
-      { inlineData: { mimeType: req.file.mimetype, data: imageBase64 } },
+      { inlineData: { mimeType: firstFile.mimetype, data: imageBase64 } },
       MMAGIC_PROMPT,
     ]);
     const raw = result.response.text();
     const cleanJson = JSON.parse(raw.replace(/```json|```/g, '').trim());
 
-    // B. Direct binary upload to WordPress (bypasses FormData bugs)
-    const ext = req.file.mimetype.split('/')[1] || 'jpg';
-    const filename = `mmagic-${Date.now()}.${ext}`;
-
-    const mediaRes = await fetch(`${wpUrl}/wp-json/wp/v2/media`, {
-      method: 'POST',
-      headers: {
-        Authorization: authHeader,
-        'Content-Disposition': `attachment; filename="${filename}"`,
-        'Content-Type': req.file.mimetype,
-        'User-Agent': 'Mmagic-Engine/1.0',
-      },
-      body: req.file.buffer,
-    });
-
-    if (!mediaRes.ok) {
-      const errText = await mediaRes.text();
-      console.error(`❌ WordPress Media Upload Rejected (${mediaRes.status}):`, errText);
-      return res.status(mediaRes.status).json({
-        error: `WordPress media upload failed (${mediaRes.status}). Check file permissions/size.`,
-      });
+    // 2. Upload ALL files to WordPress Media Library
+    const uploadedIds = [];
+    for (const file of req.files) {
+      const ext = file.mimetype.split('/')[1] || 'bin';
+      const filename = `mmagic-${Date.now()}-${Math.random().toString(36).substring(7)}.${ext}`;
+      const mediaJson = await uploadMediaToWordPress(file, filename, file.mimetype, wpUrl, authHeader);
+      if (mediaJson && mediaJson.id) uploadedIds.push(mediaJson.id);
     }
 
-    const mediaJson = await mediaRes.json();
-    console.log(`✅ Image uploaded to WP Media Library. ID: ${mediaJson.id}`);
+    if (uploadedIds.length === 0) {
+      return res.status(500).json({ error: 'No media could be uploaded to WordPress.' });
+    }
 
-    // Return the story data AND the verified WP media ID
+    // 3. Build a gallery HTML for the post body (if multiple images)
+    let galleryHtml = '';
+    if (uploadedIds.length > 1) {
+      galleryHtml = `<div class="mm-gallery" style="display:flex; flex-wrap:wrap; gap:16px; margin-top:24px;">`;
+      for (let i = 1; i < uploadedIds.length; i++) {
+        const id = uploadedIds[i];
+        galleryHtml += `<div style="flex:1 1 250px;"><img src="${wpUrl}/wp-content/uploads/${id}" alt="${cleanJson.title}" style="width:100%; height:auto; border-radius:8px;" /></div>`;
+      }
+      galleryHtml += `</div>`;
+    }
+
+    // 4. Return everything to the frontend (including media IDs and gallery HTML)
     res.json({
       ...cleanJson,
-      media_id: mediaJson.id,
+      media_ids: uploadedIds,      // Array of all WP media IDs
+      featured_media: uploadedIds[0],
+      gallery_html: galleryHtml,   // Pre-built HTML for the post body
     });
   } catch (e) {
     console.error('Analyze/Upload Error:', e.message);
@@ -140,63 +134,49 @@ app.post('/mmagic/analyze', upload.single('mm_media'), async (req, res) => {
   }
 });
 
-// --- 2. PUBLISH POST WITH ATTACHED MEDIA ---
+// --- Publishing Endpoint (unchanged logic, but now accepts media_ids and gallery_html) ---
 app.post('/mmagic/publish', express.json(), async (req, res) => {
-  const { title, story, tags, category, media_id, publishNow } = req.body;
+  const { title, story, tags, category, media_ids, featured_media, gallery_html, publishNow } = req.body;
   if (!title) return res.status(400).json({ error: 'Title is required' });
 
   try {
-    const auth = Buffer.from(
-      `${process.env.WP_USERNAME}:${process.env.WP_APP_PASSWORD}`
-    ).toString('base64');
+    const auth = Buffer.from(`${process.env.WP_USERNAME}:${process.env.WP_APP_PASSWORD}`).toString('base64');
     const authHeader = `Basic ${auth}`;
     const wpUrl = 'https://mm.world';
 
     const postData = {
       title,
-      content: `<p>${story}</p>`,
+      content: `<p>${story}</p>${gallery_html || ''}`,
       excerpt: `${story.substring(0, 150)}...`,
       status: publishNow === true ? 'publish' : 'draft',
-      meta: { _mm_magic_generated: true },
+      featured_media: parseInt(featured_media, 10),
+      meta: { _mm_magic_generated: true, _mm_media_ids: media_ids ? media_ids.join(',') : '' },
     };
 
-    // Attach Featured Image ID
-    if (media_id) {
-      postData.featured_media = parseInt(media_id, 10);
-    }
-
-    // Resolve Tags
     if (tags && tags.trim() !== '') {
       const tagArray = tags.split(',').map(t => t.trim()).filter(t => t.length > 0);
       const tagIds = await getOrCreateTagIds(tagArray, wpUrl, authHeader);
       if (tagIds.length > 0) postData.tags = tagIds;
     }
-
-    // Resolve Category
     if (category && category.trim() !== '') {
       const catId = await getOrCreateCategoryId(category, wpUrl, authHeader);
       if (catId) postData.categories = [catId];
     }
 
-    // Create post in WordPress
     const postRes = await fetch(`${wpUrl}/wp-json/wp/v2/posts`, {
       method: 'POST',
-      headers: {
-        Authorization: authHeader,
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mmagic-Engine/1.0',
-      },
-      body: JSON.stringify(postData),
+      headers: { Authorization: authHeader, 'Content-Type': 'application/json', 'User-Agent': 'Mmagic-Engine/1.0' },
+      body: JSON.stringify(postData)
     });
 
     if (!postRes.ok) {
       const errText = await postRes.text();
-      console.error(`❌ Post Creation Failed (${postRes.status}):`, errText);
-      throw new Error(`WordPress post creation rejected (${postRes.status}).`);
+      console.error(`❌ Post Creation Failed:`, errText);
+      throw new Error(`WordPress post creation rejected.`);
     }
 
     const postJson = await postRes.json();
-    console.log(`✅ Post created with featured_media ID: ${postData.featured_media}`);
+    console.log(`✅ Post created with featured_media ID: ${featured_media}`);
 
     res.json({
       success: true,
